@@ -8,7 +8,7 @@ import (
 
 func main() {
 
-	srv := socks.NewServer("0.0.0.0", 1080)
+	srv := socks.NewServerv4("0.0.0.0", 1080)
 	srv.Serve()
 	fmt.Println("WE GOT TO THE END!")
 }

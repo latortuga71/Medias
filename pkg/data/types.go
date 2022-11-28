@@ -75,8 +75,8 @@ type DOMAINNAME struct {
 }
 
 type IPV4 struct {
-	ADDR [4]byte
 	PORT [2]byte
+	ADDR [4]byte
 }
 
 type IPV6 struct {
@@ -85,6 +85,31 @@ type IPV6 struct {
 }
 
 type SocksRequestMethodV4 struct {
+	Version     byte
+	Command     byte
+	Destination IPV4 // 2 byte port followed by 4 byte address
+	UserId      byte // always zero this
+	Null        byte // zero bits
+}
+
+type ServerResponseMessageV4 struct {
+	Version     byte
+	Command     byte
+	Destination IPV4
+}
+
+func (s *ServerResponseMessageV4) ToBytes() []byte {
+	// converts to big endian
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.LittleEndian, s)
+	if err != nil {
+		fmt.Println(err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
+type SocksRequestMethodV5 struct {
 	Version byte
 	Cmd     byte
 	RSV     byte
@@ -92,7 +117,7 @@ type SocksRequestMethodV4 struct {
 	DEST    IPV4
 }
 
-type ServerResponseMessageIPV4 struct {
+type ServerResponseMessageIPV5 struct {
 	Version     byte
 	Reply       byte
 	Reserved    byte
@@ -100,7 +125,7 @@ type ServerResponseMessageIPV4 struct {
 	Bind        IPV4
 }
 
-func (s *ServerResponseMessageIPV4) ToBytes() []byte {
+func (s *ServerResponseMessageIPV5) ToBytes() []byte {
 	// converts to big endian
 	buf := new(bytes.Buffer)
 	err := binary.Write(buf, binary.BigEndian, s)
