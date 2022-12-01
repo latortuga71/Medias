@@ -125,6 +125,7 @@ func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 		responseData.Command = 0x5B
 		responseData.Version = 0x00
 		c.Connection.Write(responseData.ToBytes())
+		s.RemoveConnection(c.ConnectionId)
 		return
 	}
 	clientRequest := (*data.SocksRequestMethodV4)(unsafe.Pointer(&dataBuffer[0]))
@@ -147,26 +148,29 @@ func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 		responseData.Command = 0x5A // request granted
 		responseData.Destination = clientRequest.Destination
 		c.Connection.Write(responseData.ToBytes())
-		var clientBuffer [1]byte
-		var destBuffer [1]byte
+		clientBuffer := make([]byte, 1024)
+		destBuffer := make([]byte, 1024)
 		go func() {
 			for {
-				read, err := c.Connection.Read(clientBuffer[:])
+				read, err := c.Connection.Read(clientBuffer)
+				if read == 0 {
+					log.Logger.Info().Msgf("Zero Byte Read Socks Client closed connection.")
+					c.BlockingChannel <- 0
+					return
+				}
 				if err != nil {
 					if err != io.EOF {
+						fmt.Println(read)
 						log.Logger.Error().Msgf("Failed to read from client connection %v", err)
 						c.BlockingChannel <- 0
 						return
 					}
 				}
-				if read == 0 {
-					continue
-				}
 				// refresh client read and write connection whenver we actually read data.
 				// example using http connections arent kept alive so we have a way to clean them up.
 				c.Connection.SetDeadline(time.Now().Add(time.Second * time.Duration(s.IdleTimeout)))
 				log.Logger.Debug().Msgf("Read %d bytes from client connection", read)
-				wrote, err := destinationConn.Write(clientBuffer[:])
+				wrote, err := destinationConn.Write(clientBuffer[:read])
 				if err != nil {
 					log.Logger.Error().Msgf("Failed to forward data to destination server %v", err)
 					destinationConn.Close()
@@ -178,7 +182,13 @@ func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 		}()
 		go func() {
 			for {
-				read, err := destinationConn.Read(destBuffer[:])
+				read, err := destinationConn.Read(destBuffer)
+				if read == 0 {
+					log.Logger.Info().Msgf("Zero Byte Read Destination Server Closed connection.")
+					destinationConn.Close()
+					c.BlockingChannel <- 0
+					return
+				}
 				if err != nil {
 					if err != io.EOF {
 						log.Logger.Error().Msgf("Failed to read from dest connection %v", err)
@@ -186,13 +196,10 @@ func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 						return
 					}
 				}
-				if read == 0 {
-					continue
-				}
 				// just incase server goes offline and we arent stuck? reading?
 				destinationConn.SetDeadline(time.Now().Add(time.Second * time.Duration(s.IdleTimeout)))
 				log.Logger.Debug().Msgf("Read %d bytes from dest connection", read)
-				wrote, err := c.Connection.Write(destBuffer[:])
+				wrote, err := c.Connection.Write(destBuffer[:read])
 				if err != nil {
 					log.Logger.Error().Msgf("Failed to forward data to socks client %v", err)
 					destinationConn.Close()
@@ -251,9 +258,42 @@ func (s *Serverv4) Serve() error {
 func (s *Serverv4) Close() error {
 	return nil
 }
-func (s *Serverv4) Shutdown(ctx context.Context) error {
 
-	return nil
+func (s *Serverv4) shutdownAllConnections(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("shutdownallconnections ran out of time")
+			return
+		default:
+			fmt.Println("Looping over all connections and closing and removing them")
+			for k := range s.Conns.Connections {
+				// send int on channel
+				// only problem is we are not closing the destination connection.
+				s.Conns.Connections[k].BlockingChannel <- 0
+			}
+			log.Logger.Debug().Msgf("Closed all connections...")
+			s.Listener.Close()
+			log.Logger.Debug().Msgf("Closed listener...")
+			time.Sleep(time.Hour)
+			s.ShutdownChan <- true
+			return
+		}
+	}
+}
+
+func (s *Serverv4) Shutdown(ctx context.Context, cancel context.CancelFunc) error {
+	log.Logger.Info().Msgf("Received shutdown request.")
+	defer cancel()
+	go s.shutdownAllConnections(ctx)
+	select {
+	case <-s.ShutdownChan:
+		log.Logger.Info().Msgf("Shutdown all connections successfully")
+		return nil
+	case <-ctx.Done():
+		log.Logger.Error().Msgf("Shutdown exceeded deadline set. Exiting server anyways....")
+		return fmt.Errorf("Deadline exceeded.")
+	}
 }
 
 /*
