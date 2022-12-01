@@ -4,23 +4,23 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 	"unsafe"
 
 	"github.com/latortuga71/medias/pkg/data"
+	"github.com/latortuga71/medias/pkg/log"
 )
 
 // Each Connection
 type SocksConnection struct {
 	Connection      net.Conn
 	ConnectionId    string
-	BlockingChannel chan bool
+	IsClosed        bool
+	BlockingChannel chan int
 }
 
 // AllConnection
@@ -31,15 +31,18 @@ type SocksConnectionList struct {
 
 type Serverv4 struct {
 	// need channels to stop the Serverv4 and stuff
-	ListeningAddr string
-	ListeningPort int
-	Listener      net.Listener
-	ShutdownChan  chan bool
-	Error         error
-	Conns         *SocksConnectionList
-	// ReadTimeout ?
-	// WriteTimeout ?
-	// Max Connections ?
+	ListeningAddr      string
+	Logger             string
+	ListeningPort      int
+	Listener           net.Listener
+	ShutdownChan       chan bool
+	Error              error
+	Conns              *SocksConnectionList
+	IdleTimeout        int // this should be shorter since this is updated everytime data is read.
+	ReadTimeout        int // read and write should be pretty long. depending on what is being forwarded.
+	WriteTimeout       int
+	MaxConnections     int
+	CurrentConnections int
 }
 
 func NewSocksConnectionsList() *SocksConnectionList {
@@ -60,247 +63,203 @@ func NewServerv4(addr string, port int) *Serverv4 {
 
 }
 
+func (s *Serverv4) SetMaxConnections(max int) {
+	s.MaxConnections = max
+}
+
 func (s *Serverv4) AddConnection(c SocksConnection) error {
 	s.Conns.Mutex.Lock()
 	s.Conns.Connections[c.ConnectionId] = c
+	s.CurrentConnections++
 	s.Conns.Unlock()
+	log.Logger.Debug().Msgf("Added Connection Id %d to connection map", c.ConnectionId)
 	return nil
 }
 
 func (s *Serverv4) RemoveConnection(id string) error {
 	s.Conns.Mutex.Lock()
+	if !s.Conns.Connections[id].IsClosed {
+		s.Conns.Connections[id].Connection.Close()
+	}
 	delete(s.Conns.Connections, id)
+	s.CurrentConnections--
 	s.Conns.Unlock()
+	log.Logger.Debug().Msgf("Removed Connection %s from connection map", id)
+	log.Logger.Info().Msgf("Connections left %d", s.CurrentConnections)
 	return nil
 }
 
-func HandleVersionMessage(c *SocksConnection) (*data.VersionIdentifyMessage, error) {
-	maxSize := unsafe.Sizeof(data.VersionIdentifyMessage{}) + 1
-	dataBuffer := make([]byte, maxSize)
-	//tmpBuffer := make([]byte, 10) // read in 10 bytes chunks?
-	readBytes, err := c.Connection.Read(dataBuffer)
-	if err != nil {
-		if err != io.EOF {
-			return nil, err
-		}
+func validateClientV4Request(data []byte) (bool, error) {
+	if data[0] != 0x04 {
+		return false, fmt.Errorf("Invalid version provided by client.") // Invalid version
 	}
-	fmt.Printf("[+] HandleVersionMesssage: Read %d bytes -> data %s\n", readBytes, hex.EncodeToString(dataBuffer))
-	versionMsg := (*data.VersionIdentifyMessage)(unsafe.Pointer(&dataBuffer[0]))
-	return versionMsg, nil
+	if data[1] != 0x1 && data[1] != 0x2 {
+		return false, fmt.Errorf("Invalid command provided by client.") // invalid command not bind or connect
+	}
+	return true, nil
 }
 
-/*
-func HandleConnnectCommand(c *SocksConnection, methodData *data.SocksRequestMethodV4) {
-	// send response
-	// for now just send a response.
-	resp := data.ServerResponseMessageIPV4{}
-	resp.Version = 0x05
-	resp.Reply = 0x00 // 0x00 -> success
-	resp.Reserved = 0x00
-	resp.AddressType = methodData.ATYP
-	resp.Bind.ADDR = methodData.DEST.ADDR
-	resp.Bind.PORT = methodData.DEST.PORT
-	fmt.Println(resp.ToBytes())
-	c.Connection.Write(resp.ToBytes())
-	//clientDataToForward := make([]byte, 1024)
-	fmt.Println("SENT RESPONSE")
-	fmt.Printf("FORWARDING DATA!\n")
-	destinationConn, err := net.Dial("tcp", "0.0.0.0:80") // <- destination Serverv4.
-	if err != nil {
-		log.Fatalf("Line 102\n%v", err)
-	}
-	// forward traffic.
-	go func() {
-		t := make([]byte, 1024)
-		test := bytes.NewBuffer(t)
-		fmt.Println("Blocking read...")
-		_, err = c.Connection.Read(t)
-		if err != nil {
-			fmt.Printf("CLIENT ERR %v\n", err)
-			c.Connection.Close()
-			c.BlockingChannel <- true
-			return // not sure if wee need return
-		}
-		nBytes, err := io.Copy(destinationConn, test)
-		if err != nil {
-			fmt.Printf("CLIENT ERR %v\n", err)
-			c.Connection.Close()
-			c.BlockingChannel <- true
-			return // not sure if wee need return
-		}
-		if nBytes > 0 {
-			fmt.Printf("Transferred %d bytes\n", nBytes)
-		}
-	}()
-	go func() {
-		// check if connection is open
-		// copy bytes
-		nBytes, err := io.Copy(c.Connection, destinationConn)
-		if err != nil {
-			fmt.Printf("Serverv4 ERRR %v\n", err)
-			destinationConn.Close()
-			c.BlockingChannel <- true
-			return
-		}
-		if nBytes > 0 {
-			fmt.Printf("Transferred %d bytes\n", nBytes)
-		}
-	}()
-	fmt.Println("BLOCKING TO KEEP EXCHANGE GOING")
-	<-c.BlockingChannel
-	fmt.Println("PAST BLOCK!")
-}
-*/
-/*
-	func HandleNoAuth(c *SocksConnection) {
-		readBuffer := make([]byte, 1024)
-		reply := [2]byte{0x05, 0x00}
-		c.Connection.Write(reply[:])
-		fmt.Printf("[+] Sent Method Selection\n")
-		readBytes, err := c.Connection.Read(readBuffer)
-		if err != nil {
-			log.Fatalf("LINE 152: %v\n", err)
-		}
-		fmt.Printf("[+] READING RESPONSE BYTES %d\n", readBytes)
-		fmt.Println(hex.EncodeToString(readBuffer))
-		requestMethod := (*data.SocksRequestMethodV4)(unsafe.Pointer(&readBuffer[0]))
-		if requestMethod.Cmd == 0x02 {
-			log.Fatal("BIND COMMAND NOT IMPLEMENTED YETs")
-		}
-		if requestMethod.Cmd == 0x03 {
-			log.Fatal("UDP COMMAND NOT IMPLEMENTED YETs")
-		}
-		if requestMethod.ATYP == 0x3 {
-			log.Fatal("DNS NOT IMPLEMENTED YET")
-		}
-		if requestMethod.ATYP == 0x4 {
-			log.Fatal("IPV6 NOT IMPLEMENTED YET")
-		}
-		if requestMethod.ATYP == 0x1 {
-			fmt.Println("IPV4 CLIENT")
-		}
-		if requestMethod.Cmd == 0x01 {
-			fmt.Println("CONNECT COMMAND REQUESTED")
-			HandleConnnectCommand(c, requestMethod)
-			fmt.Println("HANDELED CONNECT COMMAND")
-		}
-	}
-*/
-
-func (s *Serverv4) HandleSocksV4(c *SocksConnection) error {
+func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 	/// read client request
 	maxSize := unsafe.Sizeof(data.SocksRequestMethodV4{}) + 1
 	dataBuffer := make([]byte, maxSize)
+	responseData := data.ServerResponseMessageV4{}
+	// wait max 15 seconds here.
+	c.Connection.SetReadDeadline(time.Now().Add(time.Second * 15))
 	readBytes, err := c.Connection.Read(dataBuffer)
 	if err != nil {
 		if err != io.EOF {
-			return err
+			log.Logger.Error().Msgf("Connection ERROR: %v Closing client connection", err)
+			s.RemoveConnection(c.ConnectionId)
+			return
 		}
 	}
-	fmt.Printf("[+] Read SOCK4 Request Message: Read %d bytes -> data %s\n", readBytes, hex.EncodeToString(dataBuffer))
-	clientRequest := (*data.SocksRequestMethodV4)(unsafe.Pointer(&dataBuffer[0]))
-	// check if request is valid TODO
-	//................
-	// establish connection to destination
-	if clientRequest.Version != 0x4 {
-		log.Println("NOT VERSION 4")
-		return errors.New("Not Version 4")
+	log.Logger.Debug().Msgf("Read SOCK4 Request Message: Read %d bytes -> data %s\n", readBytes, hex.EncodeToString(dataBuffer))
+	if readBytes <= 0 {
+		log.Logger.Error().Msgf("Not Enough Data Read From Socket Expected %d bytes got %d bytes", maxSize, readBytes)
+		s.RemoveConnection(c.ConnectionId)
+		return
 	}
-	if clientRequest.Command == 0x1 {
-		// handle connect command
-		responseData := data.ServerResponseMessageV4{}
+	if ok, err := validateClientV4Request(dataBuffer); !ok {
+		log.Logger.Error().Msgf("Socksv4 Request Validation Failed %v", err)
+		responseData.Command = 0x5B
 		responseData.Version = 0x00
-		fmt.Printf("%x %d\n", clientRequest.Destination.PORT, clientRequest.Destination.PORT)
-		destPort := binary.BigEndian.Uint16(clientRequest.Destination.PORT[:])
-		destAddressIp := net.IPv4(clientRequest.Destination.ADDR[0], clientRequest.Destination.ADDR[1], clientRequest.Destination.ADDR[2], clientRequest.Destination.ADDR[3])
-		destinationConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", destAddressIp.String(), destPort)) // <- destination Serverv4.
-		if err != nil {
-			log.Fatalf("Failed to connect to destination send back response packet.\n%v", err)
-			responseData.Command = 0x5B // request rejected or failed.
-			c.Connection.Write(responseData.ToBytes())
-			c.Connection.Close()
-			fmt.Println("connection closed!")
-			return nil
-		}
-		// send back response packet.
+		c.Connection.Write(responseData.ToBytes())
+		return
+	}
+	clientRequest := (*data.SocksRequestMethodV4)(unsafe.Pointer(&dataBuffer[0]))
+	responseData.Version = 0x00
+	destPort := binary.BigEndian.Uint16(clientRequest.Destination.PORT[:])
+	destAddressIp := net.IPv4(clientRequest.Destination.ADDR[0], clientRequest.Destination.ADDR[1], clientRequest.Destination.ADDR[2], clientRequest.Destination.ADDR[3])
+	destString := fmt.Sprintf("%s:%d", destAddressIp.String(), destPort)
+	log.Logger.Debug().Msgf("Attempting To Connect To Client Requested Destination Server %s", destString)
+	destinationConn, err := net.Dial("tcp", destString)
+	if err != nil {
+		responseData.Command = 0x5B
+		c.Connection.Write(responseData.ToBytes())
+		s.RemoveConnection(c.ConnectionId)
+		log.Logger.Error().Msgf("Failed To Connect To Destination Server %s, Closing Client Connection %v", destString, err)
+		return
+	}
+	log.Logger.Debug().Msgf("Successfully Established Connection To Client Requested Destination Server %s", destString)
+	// handle connect command
+	if clientRequest.Command == 0x1 {
 		responseData.Command = 0x5A // request granted
 		responseData.Destination = clientRequest.Destination
 		c.Connection.Write(responseData.ToBytes())
-		// forward traffic.
+		var clientBuffer [1]byte
+		var destBuffer [1]byte
 		go func() {
-			nBytes, err := io.Copy(destinationConn, c.Connection)
-			if err != nil {
-				fmt.Printf("CLIENT ERR %v\n", err)
-				c.Connection.Close()
-				c.BlockingChannel <- true
-				return // not sure if wee need return
-			}
-			if nBytes > 0 {
-				fmt.Printf("Transferred %d bytes\n", nBytes)
+			for {
+				read, err := c.Connection.Read(clientBuffer[:])
+				if err != nil {
+					if err != io.EOF {
+						log.Logger.Error().Msgf("Failed to read from client connection %v", err)
+						c.BlockingChannel <- 0
+						return
+					}
+				}
+				if read == 0 {
+					continue
+				}
+				// refresh client read and write connection whenver we actually read data.
+				// example using http connections arent kept alive so we have a way to clean them up.
+				c.Connection.SetDeadline(time.Now().Add(time.Second * time.Duration(s.IdleTimeout)))
+				log.Logger.Debug().Msgf("Read %d bytes from client connection", read)
+				wrote, err := destinationConn.Write(clientBuffer[:])
+				if err != nil {
+					log.Logger.Error().Msgf("Failed to forward data to destination server %v", err)
+					destinationConn.Close()
+					c.BlockingChannel <- 0
+					return
+				}
+				log.Logger.Debug().Msgf("Wrote %d bytes from client bufffer to destination\n", wrote)
 			}
 		}()
 		go func() {
-			// check if connection is open
-			// copy bytes
-			nBytes, err := io.Copy(c.Connection, destinationConn)
-			if err != nil {
-				fmt.Printf("Serverv4 ERRR %v\n", err)
-				destinationConn.Close()
-				c.BlockingChannel <- true
-				return
-			}
-			if nBytes > 0 {
-				fmt.Printf("Transferred %d bytes\n", nBytes)
+			for {
+				read, err := destinationConn.Read(destBuffer[:])
+				if err != nil {
+					if err != io.EOF {
+						log.Logger.Error().Msgf("Failed to read from dest connection %v", err)
+						c.BlockingChannel <- 0
+						return
+					}
+				}
+				if read == 0 {
+					continue
+				}
+				// just incase server goes offline and we arent stuck? reading?
+				destinationConn.SetDeadline(time.Now().Add(time.Second * time.Duration(s.IdleTimeout)))
+				log.Logger.Debug().Msgf("Read %d bytes from dest connection", read)
+				wrote, err := c.Connection.Write(destBuffer[:])
+				if err != nil {
+					log.Logger.Error().Msgf("Failed to forward data to socks client %v", err)
+					destinationConn.Close()
+					c.BlockingChannel <- 0
+					return
+				}
+				log.Logger.Debug().Msgf("Wrote %d bytes from destination server to socks client\n", wrote)
 			}
 		}()
-		fmt.Println("BLOCKING TO KEEP EXCHANGE GOING")
-		time.Sleep(time.Second * 10)
-		c.Connection.Close()
+		<-c.BlockingChannel
 		s.RemoveConnection(c.ConnectionId)
-		fmt.Println("PAST BLOCK!")
-		return nil
+		return
 	}
 	if clientRequest.Command == 0x2 {
 		// handle bind request
-		log.Fatalf("bind not implemented")
+		log.Logger.Error().Msgf("Client Requested BIND Command This Hasnt Been Implemented Yet %v", err)
 	}
-	log.Fatalf("invalid command")
-	return nil
-}
-
-func (s *Serverv4) HandleClient(c SocksConnection) error {
-	s.HandleSocksV4(&c)
-	return nil
+	log.Logger.Error().Msgf("Invalid Command Recieved Closing Connection. %v", err)
+	s.RemoveConnection(c.ConnectionId)
+	return
 }
 
 func (s *Serverv4) Serve() error {
-	connections := 0
-	// return errrors from here if something goes wrong.
-	s.Listener, s.Error = net.Listen("tcp4", fmt.Sprintf("%s:%d", s.ListeningAddr, s.ListeningPort))
+	s.MaxConnections = 100
+	s.IdleTimeout = 120 // seconds
+	endpoint := fmt.Sprintf("%s:%d", s.ListeningAddr, s.ListeningPort)
+	log.Logger.Info().Msgf("Started Socksv4 Proxy On %s", endpoint)
+	s.Listener, s.Error = net.Listen("tcp4", endpoint)
 	if s.Error != nil {
-		log.Fatalf("SERVE ERRROR %v", s.Error)
+		log.Logger.Error().Msgf("Failed to listen on %s %v", endpoint, s.Error)
+		return s.Error
 	}
 	for {
+		if s.CurrentConnections+1 >= s.MaxConnections {
+			log.Logger.Error().Msgf("Failed to accept connection, currently at max connection capacity %d.", s.MaxConnections)
+			continue
+		}
 		conn, err := s.Listener.Accept()
 		if err != nil {
-			log.Fatalf("ACCEPT ERROR %v", err)
+			log.Logger.Error().Msgf("Failed to accept connection %v", err)
+			return err
 		}
-		// 5 seconds
-		conn.SetReadDeadline(time.Now().Add(time.Second * 5))
-		conn.SetWriteDeadline(time.Now().Add(time.Second * 5))
-		fmt.Printf("[+] Connection From %s\n", conn.RemoteAddr())
-		connectionId := fmt.Sprintf("%x", connections)
-		clientConnection := SocksConnection{Connection: conn, ConnectionId: connectionId}
+		log.Logger.Info().Msgf("New Connection From %s", conn.RemoteAddr().String())
+		connectionId := fmt.Sprintf("%x", s.CurrentConnections)
+		clientConnection := SocksConnection{
+			Connection:      conn,
+			ConnectionId:    connectionId,
+			IsClosed:        false,
+			BlockingChannel: make(chan int, 1),
+		}
 		s.AddConnection(clientConnection)
-		connections += 1
-		go s.HandleClient(clientConnection)
+		go s.HandleSocksV4(clientConnection)
 	}
-	return nil
 }
 
 func (s *Serverv4) Close() error {
 	return nil
 }
 func (s *Serverv4) Shutdown(ctx context.Context) error {
+
 	return nil
 }
+
+/*
+
+func (s *Serverv4) HandleClient(c SocksConnection) error {
+	err := s.HandleSocksV4(&c)
+	return err
+}
+*/
