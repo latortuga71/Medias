@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 	"unsafe"
 
@@ -15,52 +14,41 @@ import (
 	"github.com/latortuga71/medias/pkg/log"
 )
 
-// Each Connection
-type SocksConnection struct {
-	Connection      net.Conn
-	ConnectionId    string
-	IsClosed        bool
-	BlockingChannel chan int
-}
-
-// AllConnection
-type SocksConnectionList struct {
-	sync.Mutex
-	Connections map[string]SocksConnection
-}
-
 type Serverv4 struct {
-	// need channels to stop the Serverv4 and stuff
-	ListeningAddr      string
-	Logger             string
-	ListeningPort      int
-	Listener           net.Listener
-	ShutdownChan       chan bool
-	Error              error
-	Conns              *SocksConnectionList
-	IdleTimeout        int // this should be shorter since this is updated everytime data is read.
-	ReadTimeout        int // read and write should be pretty long. depending on what is being forwarded.
-	WriteTimeout       int
+	ListeningAddr string
+	Logger        string
+	ListeningPort int
+	Listener      net.Listener
+	ShutdownChan  chan bool
+	Error         error
+	Conns         *SocksConnectionList
+	// how long should we wait for data to be sent over the tcp connection.
+	IdleTimeout        int
 	MaxConnections     int
 	CurrentConnections int
 }
 
-func NewSocksConnectionsList() *SocksConnectionList {
-	return &SocksConnectionList{
-		Connections: make(map[string]SocksConnection, 1),
+func (s *Serverv4) shutdownAllConnections(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			// shutdown deadline exceeded.
+			return
+		default:
+			for k := range s.Conns.Connections {
+				s.Conns.Connections[k].BlockingChannel <- 0 // only problem is we are not closing the destination connection but it should close anyways.
+			}
+			log.Logger.Debug().Msgf("Closed all connections...")
+			s.Listener.Close()
+			log.Logger.Debug().Msgf("Closed listener...")
+			s.ShutdownChan <- true
+			return
+		}
 	}
 }
 
-func NewServerv4(addr string, port int) *Serverv4 {
-	return &Serverv4{
-		ListeningAddr: addr,
-		ListeningPort: port,
-		Listener:      nil,
-		ShutdownChan:  make(chan bool),
-		Error:         nil,
-		Conns:         NewSocksConnectionsList(),
-	}
-
+func (s *Serverv4) SetIdleTimeout(idleSeconds int) {
+	s.IdleTimeout = idleSeconds
 }
 
 func (s *Serverv4) SetMaxConnections(max int) {
@@ -89,17 +77,7 @@ func (s *Serverv4) RemoveConnection(id string) error {
 	return nil
 }
 
-func validateClientV4Request(data []byte) (bool, error) {
-	if data[0] != 0x04 {
-		return false, fmt.Errorf("Invalid version provided by client.") // Invalid version
-	}
-	if data[1] != 0x1 && data[1] != 0x2 {
-		return false, fmt.Errorf("Invalid command provided by client.") // invalid command not bind or connect
-	}
-	return true, nil
-}
-
-func (s *Serverv4) HandleSocksV4(c SocksConnection) {
+func (s *Serverv4) HandleClient(c SocksConnection) {
 	/// read client request
 	maxSize := unsafe.Sizeof(data.SocksRequestMethodV4{}) + 1
 	dataBuffer := make([]byte, maxSize)
@@ -120,7 +98,7 @@ func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 		s.RemoveConnection(c.ConnectionId)
 		return
 	}
-	if ok, err := validateClientV4Request(dataBuffer); !ok {
+	if ok, err := validateClientRequest(dataBuffer, 4); !ok {
 		log.Logger.Error().Msgf("Socksv4 Request Validation Failed %v", err)
 		responseData.Command = 0x5B
 		responseData.Version = 0x00
@@ -216,6 +194,7 @@ func (s *Serverv4) HandleSocksV4(c SocksConnection) {
 	if clientRequest.Command == 0x2 {
 		// handle bind request
 		log.Logger.Error().Msgf("Client Requested BIND Command This Hasnt Been Implemented Yet %v", err)
+		panic("#TODO BIND NOT IMPLMENETED!")
 	}
 	log.Logger.Error().Msgf("Invalid Command Recieved Closing Connection. %v", err)
 	s.RemoveConnection(c.ConnectionId)
@@ -232,6 +211,7 @@ func (s *Serverv4) Serve() error {
 		log.Logger.Error().Msgf("Failed to listen on %s %v", endpoint, s.Error)
 		return s.Error
 	}
+	defer s.Listener.Close()
 	for {
 		if s.CurrentConnections+1 >= s.MaxConnections {
 			log.Logger.Error().Msgf("Failed to accept connection, currently at max connection capacity %d.", s.MaxConnections)
@@ -251,39 +231,12 @@ func (s *Serverv4) Serve() error {
 			BlockingChannel: make(chan int, 1),
 		}
 		s.AddConnection(clientConnection)
-		go s.HandleSocksV4(clientConnection)
-	}
-}
-
-func (s *Serverv4) Close() error {
-	return nil
-}
-
-func (s *Serverv4) shutdownAllConnections(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("shutdownallconnections ran out of time")
-			return
-		default:
-			fmt.Println("Looping over all connections and closing and removing them")
-			for k := range s.Conns.Connections {
-				// send int on channel
-				// only problem is we are not closing the destination connection.
-				s.Conns.Connections[k].BlockingChannel <- 0
-			}
-			log.Logger.Debug().Msgf("Closed all connections...")
-			s.Listener.Close()
-			log.Logger.Debug().Msgf("Closed listener...")
-			time.Sleep(time.Hour)
-			s.ShutdownChan <- true
-			return
-		}
+		go s.HandleClient(clientConnection)
 	}
 }
 
 func (s *Serverv4) Shutdown(ctx context.Context, cancel context.CancelFunc) error {
-	log.Logger.Info().Msgf("Received shutdown request.")
+	log.Logger.Info().Msgf("Received shutdown request...")
 	defer cancel()
 	go s.shutdownAllConnections(ctx)
 	select {
@@ -291,15 +244,7 @@ func (s *Serverv4) Shutdown(ctx context.Context, cancel context.CancelFunc) erro
 		log.Logger.Info().Msgf("Shutdown all connections successfully")
 		return nil
 	case <-ctx.Done():
-		log.Logger.Error().Msgf("Shutdown exceeded deadline set. Exiting server anyways....")
-		return fmt.Errorf("Deadline exceeded.")
+		log.Logger.Error().Msgf("Shutdown deadline exceeeded.")
+		return fmt.Errorf("Shutdown Deadline exceeded.")
 	}
 }
-
-/*
-
-func (s *Serverv4) HandleClient(c SocksConnection) error {
-	err := s.HandleSocksV4(&c)
-	return err
-}
-*/

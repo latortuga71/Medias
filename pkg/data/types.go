@@ -64,11 +64,6 @@ func (v *VersionIdentifyMessage) ParseMethods() AuthTypes {
 
 */
 
-type MethodSelectionMethod struct {
-	Version byte
-	Method  byte
-}
-
 type DOMAINNAME struct {
 	NAME []byte
 	PORT [2]byte
@@ -109,22 +104,65 @@ func (s *ServerResponseMessageV4) ToBytes() []byte {
 	return buf.Bytes()
 }
 
-type SocksRequestMethodV5 struct {
+type SocksNegotiateRequest struct {
+	Version  byte
+	Nmethods byte
+	Methods  [255]byte
+}
+
+type SocksNegotiateResponse struct {
+	Version byte
+	Method  byte
+}
+
+func ToBytes(s interface{}) []byte {
+	// converts to big endian
+	buf := new(bytes.Buffer)
+	err := binary.Write(buf, binary.LittleEndian, s)
+	if err != nil {
+		fmt.Println(err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
+type Socksv5Requestv4 struct {
 	Version byte
 	Cmd     byte
 	RSV     byte
 	ATYP    byte
-	DEST    IPV4
+	ADDRESS [4]byte // if ipv4
+	PORT    [2]byte
 }
 
-type ServerResponseMessageIPV5 struct {
+type SocksV5Responsev4 struct {
 	Version     byte
 	Reply       byte
 	Reserved    byte
 	AddressType byte
-	Bind        IPV4
+	ADDRESS     [4]byte // if ipv4
+	PORT        [2]byte
 }
 
+type Socksv5Requestv6 struct {
+	Version byte
+	Cmd     byte
+	RSV     byte
+	ATYP    byte
+	ADDRESS [16]byte // if ipv6
+	PORT    [2]byte
+}
+
+type SocksV5Responsev6 struct {
+	Version     byte
+	Reply       byte
+	Reserved    byte
+	AddressType byte
+	ADDRESS     [16]byte // if ipv6
+	PORT        [2]byte
+}
+
+/*
 func (s *ServerResponseMessageIPV5) ToBytes() []byte {
 	// converts to big endian
 	buf := new(bytes.Buffer)
@@ -135,3 +173,4 @@ func (s *ServerResponseMessageIPV5) ToBytes() []byte {
 	}
 	return buf.Bytes()
 }
+*/
